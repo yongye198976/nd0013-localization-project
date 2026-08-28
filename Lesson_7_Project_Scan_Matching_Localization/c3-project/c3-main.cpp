@@ -201,15 +201,85 @@ int main(){
 			
 			new_scan = true;
 			// TODO: (Filter scan using voxel filter)
+			new_scan = false;
+			struct ScanCaptureGuard{
+				bool& ready;
+				ScanCaptureGuard(bool& scan_ready) : ready(scan_ready) {}
+				~ScanCaptureGuard(){ ready = true; }
+			} scan_capture_guard(new_scan);
+			PointCloudT::Ptr stable_scan(new PointCloudT);
+			*stable_scan = *scanCloud;
+			pcl::VoxelGrid<PointT> voxel_filter;
+			voxel_filter.setInputCloud(stable_scan);
+			voxel_filter.setLeafSize(0.5f, 0.5f, 0.5f);
+			voxel_filter.filter(*cloudFiltered);
+			PointCloudT::Ptr calibrated_scan(new PointCloudT);
+			Eigen::Matrix4d lidar_to_vehicle = transform2D(-pi / 2.0, 0, 0);
+			pcl::transformPointCloud(*cloudFiltered, *calibrated_scan, lidar_to_vehicle);
 
 			// TODO: Find pose transform by using ICP or NDT matching
-			//pose = ....
+			double simulation_time = world.GetSnapshot().GetTimestamp().elapsed_seconds;
+			static double previous_simulation_time = simulation_time;
+			double delta_time = simulation_time - previous_simulation_time;
+			previous_simulation_time = simulation_time;
+			delta_time = min(delta_time, 0.5);
+			auto velocity = vehicle->GetVelocity();
+			auto angular_velocity = vehicle->GetAngularVelocity();
+			static double previous_velocity_x = 0;
+			static double previous_velocity_y = 0;
+			static double previous_angular_velocity_z = 0;
+			double horizontal_speed = sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+			Pose predicted_pose = pose;
+			if(horizontal_speed > 0.1){
+				predicted_pose.position.x += 0.5 * (previous_velocity_x + velocity.x) * delta_time;
+				predicted_pose.position.y += 0.5 * (previous_velocity_y + velocity.y) * delta_time;
+				predicted_pose.rotation.yaw += 0.5
+					* (previous_angular_velocity_z + angular_velocity.z) * pi / 180.0 * delta_time;
+			}
+			previous_velocity_x = velocity.x;
+			previous_velocity_y = velocity.y;
+			previous_angular_velocity_z = angular_velocity.z;
+			Eigen::Matrix4d initial_guess = transform3D(
+				predicted_pose.rotation.yaw, 0, 0,
+				predicted_pose.position.x, predicted_pose.position.y, 0);
+			PointCloudT::Ptr initial_scan(new PointCloudT);
+			pcl::transformPointCloud(*cloudFiltered, *initial_scan, initial_guess);
+
+			pcl::IterativeClosestPoint<PointT, PointT> icp;
+			icp.setMaximumIterations(20);
+			icp.setMaxCorrespondenceDistance(2.0);
+			icp.setTransformationEpsilon(0.001);
+			icp.setEuclideanFitnessEpsilon(0.01);
+			icp.setInputSource(initial_scan);
+			icp.setInputTarget(mapCloud);
+			PointCloudT::Ptr aligned_scan(new PointCloudT);
+			icp.align(*aligned_scan);
+			Eigen::Matrix4d estimated_transform = initial_guess;
+			Eigen::Matrix4d correction = icp.getFinalTransformation().cast<double>();
+			double correction_distance = sqrt(
+				correction(0, 3) * correction(0, 3) + correction(1, 3) * correction(1, 3));
+			double correction_yaw = abs(atan2(correction(1, 0), correction(0, 0)));
+			if(horizontal_speed > 0.1 && icp.hasConverged()
+				&& correction_distance < 0.05 && correction_yaw < 0.05){
+				estimated_transform = correction * initial_guess;
+				Pose estimated_pose = getPose(estimated_transform);
+				pose = Pose(Point(estimated_pose.position.x, estimated_pose.position.y, 0),
+					Rotate(estimated_pose.rotation.yaw, 0, 0));
+			}
+			else if(horizontal_speed > 0.1){
+				pose = predicted_pose;
+			}
+			estimated_transform = transform3D(
+				pose.rotation.yaw, 0, 0,
+				pose.position.x, pose.position.y, 0);
 
 			// TODO: Transform scan so it aligns with ego's actual pose and render that scan
+			PointCloudT::Ptr transformed_scan(new PointCloudT);
+			pcl::transformPointCloud(*calibrated_scan, *transformed_scan, estimated_transform);
 
 			viewer->removePointCloud("scan");
 			// TODO: Change `scanCloud` below to your transformed scan
-			renderPointCloud(viewer, scanCloud, "scan", Color(1,0,0) );
+			renderPointCloud(viewer, transformed_scan, "scan", Color(1,0,0) );
 
 			viewer->removeAllShapes();
 			drawCar(pose, 1,  Color(0,1,0), 0.35, viewer);
