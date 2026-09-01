@@ -237,7 +237,7 @@ int main(){
 				scan_ready.store(false);
 			}
 
-			// Downsample the scan before registration.
+			// TODO: (Filter scan using voxel filter)
 			pcl::VoxelGrid<PointT> voxel_filter;
 			voxel_filter.setInputCloud(stable_scan);
 			voxel_filter.setLeafSize(0.5f, 0.5f, 0.5f);
@@ -286,6 +286,7 @@ int main(){
 			map_crop.filter(*local_map);
 
 			double measured_distance = 0;
+			// TODO: Find pose transform by using ICP or NDT matching
 			pcl::IterativeClosestPoint<PointT, PointT> map_icp;
 			map_icp.setMaximumIterations(20);
 			map_icp.setMaxCorrespondenceDistance(2.0);
@@ -355,11 +356,12 @@ int main(){
 				vehicle->ApplyControl(control);
 			}
 
-			// Transform the scan into the map frame for visualization.
+			// TODO: Transform scan so it aligns with ego's actual pose and render that scan
 			PointCloudT::Ptr transformed_scan(new PointCloudT);
 			pcl::transformPointCloud(*registration_scan, *transformed_scan, estimated_transform);
 
 			viewer->removePointCloud("scan");
+			// TODO: Change `scanCloud` below to your transformed scan
 			renderPointCloud(viewer, transformed_scan, "scan", Color(1,0,0) );
 
 			viewer->removeAllShapes();
