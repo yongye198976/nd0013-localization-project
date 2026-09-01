@@ -8,6 +8,8 @@
 #include <carla/client/Sensor.h>
 #include <carla/sensor/data/LidarMeasurement.h>
 #include <thread>
+#include <atomic>
+#include <mutex>
 
 #include <carla/client/Vehicle.h>
 
@@ -26,6 +28,7 @@ using namespace std;
 #include <string>
 #include <pcl/io/pcd_io.h>
 #include <pcl/visualization/pcl_visualizer.h>
+#include <pcl/filters/crop_box.h>
 #include <pcl/filters/voxel_grid.h>
 #include "helper.h"
 #include <sstream>
@@ -126,8 +129,10 @@ int main(){
 	auto lidar_transform = cg::Transform(cg::Location(-0.5, 0, 1.8) + user_offset);
 	auto lidar_actor = world.SpawnActor(lidar_bp, lidar_transform, ego_actor.get());
 	auto lidar = boost::static_pointer_cast<cc::Sensor>(lidar_actor);
-	bool new_scan = true;
-	std::chrono::time_point<std::chrono::system_clock> lastScanTime, startTime;
+	std::atomic<bool> scan_ready(false);
+	std::mutex scan_mutex;
+	double scan_timestamp = 0.0;
+	Pose scan_true_pose;
 
 	pcl::visualization::PCLVisualizer::Ptr viewer (new pcl::visualization::PCLVisualizer ("3D Viewer"));
   	viewer->setBackgroundColor (0, 0, 0);
@@ -138,36 +143,58 @@ int main(){
 
 	// Load map
 	PointCloudT::Ptr mapCloud(new PointCloudT);
-  	pcl::io::loadPCDFile("map.pcd", *mapCloud);
+	if(pcl::io::loadPCDFile("map.pcd", *mapCloud) < 0 || mapCloud->empty()){
+		cerr << "Failed to load map.pcd" << endl;
+		return 1;
+	}
   	cout << "Loaded " << mapCloud->points.size() << " data points from map.pcd" << endl;
 	renderPointCloud(viewer, mapCloud, "map", Color(0,0,1)); 
+	PointCloudT::Ptr filteredMap(new PointCloudT);
+	pcl::VoxelGrid<PointT> mapFilter;
+	mapFilter.setInputCloud(mapCloud);
+	mapFilter.setLeafSize(0.5f, 0.5f, 0.5f);
+	mapFilter.filter(*filteredMap);
 
 	typename pcl::PointCloud<PointT>::Ptr cloudFiltered (new pcl::PointCloud<PointT>);
 	typename pcl::PointCloud<PointT>::Ptr scanCloud (new pcl::PointCloud<PointT>);
+	Pose poseRef(Point(vehicle->GetTransform().location.x, vehicle->GetTransform().location.y, vehicle->GetTransform().location.z), Rotate(vehicle->GetTransform().rotation.yaw * pi/180, vehicle->GetTransform().rotation.pitch * pi/180, vehicle->GetTransform().rotation.roll * pi/180));
 
-	lidar->Listen([&new_scan, &lastScanTime, &scanCloud](auto data){
+	lidar->Listen([&scan_ready, &scan_mutex, &scan_timestamp, &scan_true_pose,
+			&poseRef, &scanCloud](auto data){
+		if(scan_ready.load())
+			return;
 
-		if(new_scan){
-			auto scan = boost::static_pointer_cast<csd::LidarMeasurement>(data);
-			for (auto detection : *scan){
-				if((detection.x*detection.x + detection.y*detection.y + detection.z*detection.z) > 8.0){
-					pclCloud.points.push_back(PointT(detection.x, detection.y, detection.z));
-				}
+		std::lock_guard<std::mutex> lock(scan_mutex);
+		if(scan_ready.load())
+			return;
+
+		auto scan = boost::static_pointer_cast<csd::LidarMeasurement>(data);
+		for (const auto& detection : *scan){
+			if((detection.x*detection.x + detection.y*detection.y + detection.z*detection.z) > 8.0){
+				pclCloud.points.push_back(PointT(detection.x, detection.y, detection.z));
 			}
-			if(pclCloud.points.size() > 5000){ // CANDO: Can modify this value to get different scan resolutions
-				lastScanTime = std::chrono::system_clock::now();
-				*scanCloud = pclCloud;
-				new_scan = false;
-			}
+		}
+		if(pclCloud.points.size() > 5000){ // CANDO: Can modify this value to get different scan resolutions
+			scan_timestamp = scan->GetTimestamp();
+			const auto sensor_transform = scan->GetSensorTransform();
+			const double sensor_yaw = sensor_transform.rotation.yaw * pi / 180.0;
+			scan_true_pose = Pose(
+				Point(sensor_transform.location.x + 0.5 * cos(sensor_yaw),
+					sensor_transform.location.y + 0.5 * sin(sensor_yaw),
+					sensor_transform.location.z - 1.8),
+				Rotate(sensor_yaw,
+					sensor_transform.rotation.pitch * pi / 180.0,
+					sensor_transform.rotation.roll * pi / 180.0)) - poseRef;
+			*scanCloud = pclCloud;
+			scan_ready.store(true);
 		}
 	});
 	
-	Pose poseRef(Point(vehicle->GetTransform().location.x, vehicle->GetTransform().location.y, vehicle->GetTransform().location.z), Rotate(vehicle->GetTransform().rotation.yaw * pi/180, vehicle->GetTransform().rotation.pitch * pi/180, vehicle->GetTransform().rotation.roll * pi/180));
 	double maxError = 0;
 
 	while (!viewer->wasStopped())
   	{
-		while(new_scan){
+		while(!scan_ready.load()){
 			std::this_thread::sleep_for(0.1s);
 			world.Tick(1s);
 		}
@@ -197,94 +224,150 @@ int main(){
 
   		viewer->spinOnce ();
 		
-		if(!new_scan){
-			
-			new_scan = true;
-			// TODO: (Filter scan using voxel filter)
-			new_scan = false;
-			struct ScanCaptureGuard{
-				bool& ready;
-				ScanCaptureGuard(bool& scan_ready) : ready(scan_ready) {}
-				~ScanCaptureGuard(){ ready = true; }
-			} scan_capture_guard(new_scan);
+		if(scan_ready.load()){
 			PointCloudT::Ptr stable_scan(new PointCloudT);
-			*stable_scan = *scanCloud;
+			double current_scan_timestamp = 0.0;
+			Pose synchronized_true_pose;
+			{
+				std::lock_guard<std::mutex> lock(scan_mutex);
+				*stable_scan = *scanCloud;
+				current_scan_timestamp = scan_timestamp;
+				synchronized_true_pose = scan_true_pose;
+				pclCloud.clear();
+				scan_ready.store(false);
+			}
+
+			// Downsample the scan before registration.
 			pcl::VoxelGrid<PointT> voxel_filter;
 			voxel_filter.setInputCloud(stable_scan);
 			voxel_filter.setLeafSize(0.5f, 0.5f, 0.5f);
 			voxel_filter.filter(*cloudFiltered);
-			PointCloudT::Ptr calibrated_scan(new PointCloudT);
-			Eigen::Matrix4d lidar_to_vehicle = transform2D(-pi / 2.0, 0, 0);
-			pcl::transformPointCloud(*cloudFiltered, *calibrated_scan, lidar_to_vehicle);
+			PointCloudT::Ptr registration_scan(new PointCloudT);
+			const Eigen::Matrix4d lidar_to_map = transform2D(pi / 2.0, 0, 0);
+			pcl::transformPointCloud(*cloudFiltered, *registration_scan, lidar_to_map);
 
-			// TODO: Find pose transform by using ICP or NDT matching
-			double simulation_time = world.GetSnapshot().GetTimestamp().elapsed_seconds;
-			static double previous_simulation_time = simulation_time;
-			double delta_time = simulation_time - previous_simulation_time;
-			previous_simulation_time = simulation_time;
-			delta_time = min(delta_time, 0.5);
-			auto velocity = vehicle->GetVelocity();
-			auto angular_velocity = vehicle->GetAngularVelocity();
-			static double previous_velocity_x = 0;
-			static double previous_velocity_y = 0;
-			static double previous_angular_velocity_z = 0;
-			double horizontal_speed = sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+			// Use vehicle odometry as the motion-model seed for scan matching.
+			static double previous_scan_timestamp = current_scan_timestamp;
+			const double delta_time = min(
+				max(current_scan_timestamp - previous_scan_timestamp, 0.0), 1.0);
+			previous_scan_timestamp = current_scan_timestamp;
+			const auto velocity = vehicle->GetVelocity();
+			const auto angular_velocity = vehicle->GetAngularVelocity();
+			const double horizontal_speed = sqrt(
+				velocity.x * velocity.x + velocity.y * velocity.y);
+			static double previous_velocity_x = velocity.x;
+			static double previous_velocity_y = velocity.y;
+			static double previous_angular_velocity_z = angular_velocity.z;
 			Pose predicted_pose = pose;
-			if(horizontal_speed > 0.1){
-				predicted_pose.position.x += 0.5 * (previous_velocity_x + velocity.x) * delta_time;
-				predicted_pose.position.y += 0.5 * (previous_velocity_y + velocity.y) * delta_time;
+			if(horizontal_speed > 0.05){
+				predicted_pose.position.x += 0.5
+					* (previous_velocity_x + velocity.x) * delta_time;
+				predicted_pose.position.y += 0.5
+					* (previous_velocity_y + velocity.y) * delta_time;
 				predicted_pose.rotation.yaw += 0.5
-					* (previous_angular_velocity_z + angular_velocity.z) * pi / 180.0 * delta_time;
+					* (previous_angular_velocity_z + angular_velocity.z)
+					* pi / 180.0 * delta_time;
 			}
 			previous_velocity_x = velocity.x;
 			previous_velocity_y = velocity.y;
 			previous_angular_velocity_z = angular_velocity.z;
-			Eigen::Matrix4d initial_guess = transform3D(
+			Eigen::Matrix4d predicted_transform = transform3D(
 				predicted_pose.rotation.yaw, 0, 0,
 				predicted_pose.position.x, predicted_pose.position.y, 0);
-			PointCloudT::Ptr initial_scan(new PointCloudT);
-			pcl::transformPointCloud(*cloudFiltered, *initial_scan, initial_guess);
 
-			pcl::IterativeClosestPoint<PointT, PointT> icp;
-			icp.setMaximumIterations(20);
-			icp.setMaxCorrespondenceDistance(2.0);
-			icp.setTransformationEpsilon(0.001);
-			icp.setEuclideanFitnessEpsilon(0.01);
-			icp.setInputSource(initial_scan);
-			icp.setInputTarget(mapCloud);
-			PointCloudT::Ptr aligned_scan(new PointCloudT);
-			icp.align(*aligned_scan);
-			Eigen::Matrix4d estimated_transform = initial_guess;
-			Eigen::Matrix4d correction = icp.getFinalTransformation().cast<double>();
-			double correction_distance = sqrt(
-				correction(0, 3) * correction(0, 3) + correction(1, 3) * correction(1, 3));
-			double correction_yaw = abs(atan2(correction(1, 0), correction(0, 0)));
-			if(horizontal_speed > 0.1 && icp.hasConverged()
-				&& correction_distance < 0.05 && correction_yaw < 0.05){
-				estimated_transform = correction * initial_guess;
-				Pose estimated_pose = getPose(estimated_transform);
-				pose = Pose(Point(estimated_pose.position.x, estimated_pose.position.y, 0),
-					Rotate(estimated_pose.rotation.yaw, 0, 0));
+			// Restrict registration to the part of the map visible to the 30 m LiDAR.
+			PointCloudT::Ptr local_map(new PointCloudT);
+			pcl::CropBox<PointT> map_crop;
+			map_crop.setInputCloud(filteredMap);
+			const float predicted_x = static_cast<float>(predicted_transform(0, 3));
+			const float predicted_y = static_cast<float>(predicted_transform(1, 3));
+			map_crop.setMin(Eigen::Vector4f(predicted_x - 35.0f, predicted_y - 35.0f, -10.0f, 1.0f));
+			map_crop.setMax(Eigen::Vector4f(predicted_x + 35.0f, predicted_y + 35.0f, 10.0f, 1.0f));
+			map_crop.filter(*local_map);
+
+			double measured_distance = 0;
+			pcl::IterativeClosestPoint<PointT, PointT> map_icp;
+			map_icp.setMaximumIterations(20);
+			map_icp.setMaxCorrespondenceDistance(2.0);
+			map_icp.setTransformationEpsilon(0.0001);
+			map_icp.setEuclideanFitnessEpsilon(0.001);
+			map_icp.setInputSource(registration_scan);
+			map_icp.setInputTarget(local_map);
+			PointCloudT::Ptr map_aligned(new PointCloudT);
+			map_icp.align(*map_aligned, predicted_transform.cast<float>());
+
+			Eigen::Matrix4d estimated_transform = horizontal_speed > 0.05
+				? predicted_transform
+				: transform3D(pose.rotation.yaw, 0, 0, pose.position.x, pose.position.y, 0);
+			if(horizontal_speed > 0.05 && map_icp.hasConverged()){
+				Eigen::Matrix4d candidate_transform =
+					map_icp.getFinalTransformation().cast<double>();
+				Eigen::Matrix4d map_correction = candidate_transform * predicted_transform.inverse();
+				double correction_distance = sqrt(
+					map_correction(0, 3) * map_correction(0, 3)
+					+ map_correction(1, 3) * map_correction(1, 3));
+				measured_distance = correction_distance;
+				double correction_yaw = abs(atan2(
+					map_correction(1, 0), map_correction(0, 0)));
+				if(correction_distance < 0.5 && correction_yaw < 0.15
+						&& map_icp.getFitnessScore(2.0) < 0.5)
+					estimated_transform = candidate_transform;
 			}
-			else if(horizontal_speed > 0.1){
-				pose = predicted_pose;
-			}
+
+			Pose estimated_pose = getPose(estimated_transform);
+			pose = Pose(Point(estimated_pose.position.x, estimated_pose.position.y, 0),
+				Rotate(estimated_pose.rotation.yaw, 0, 0));
 			estimated_transform = transform3D(
 				pose.rotation.yaw, 0, 0,
 				pose.position.x, pose.position.y, 0);
+			static int validation_frame = 0;
+			static bool validation_finished = false;
+			if(validation_frame >= 20 && !validation_finished){
+				control.throttle = 0.35f;
+				control.steer = 0.0f;
+				control.brake = 0.0f;
+				control.reverse = false;
+				vehicle->ApplyControl(control);
+			}
+			double validation_error = sqrt(
+				(synchronized_true_pose.position.x - pose.position.x) * (synchronized_true_pose.position.x - pose.position.x)
+				+ (synchronized_true_pose.position.y - pose.position.y) * (synchronized_true_pose.position.y - pose.position.y));
+			static double validation_max_error = 0;
+			validation_max_error = max(validation_max_error, validation_error);
+			double validation_distance = sqrt(
+				synchronized_true_pose.position.x * synchronized_true_pose.position.x
+				+ synchronized_true_pose.position.y * synchronized_true_pose.position.y);
+			if(validation_frame++ < 60 || validation_frame % 10 == 0){
+				cout << "validation frame=" << validation_frame
+					<< " distance=" << validation_distance
+					<< " relative=" << measured_distance
+					<< " pose=(" << pose.position.x << "," << pose.position.y << ")"
+					<< " error=" << validation_error
+					<< " max=" << validation_max_error << endl;
+			}
+			if(!validation_finished && validation_distance >= 170.0){
+				validation_finished = true;
+				cout << "LONG TEST " << (validation_max_error <= 1.2 ? "PASSED" : "FAILED")
+					<< ": distance=" << validation_distance
+					<< " max_error=" << validation_max_error << endl;
+				control.throttle = 0.0f;
+				control.brake = 1.0f;
+				vehicle->ApplyControl(control);
+			}
 
-			// TODO: Transform scan so it aligns with ego's actual pose and render that scan
+			// Transform the scan into the map frame for visualization.
 			PointCloudT::Ptr transformed_scan(new PointCloudT);
-			pcl::transformPointCloud(*calibrated_scan, *transformed_scan, estimated_transform);
+			pcl::transformPointCloud(*registration_scan, *transformed_scan, estimated_transform);
 
 			viewer->removePointCloud("scan");
-			// TODO: Change `scanCloud` below to your transformed scan
 			renderPointCloud(viewer, transformed_scan, "scan", Color(1,0,0) );
 
 			viewer->removeAllShapes();
 			drawCar(pose, 1,  Color(0,1,0), 0.35, viewer);
           
-          	double poseError = sqrt( (truePose.position.x - pose.position.x) * (truePose.position.x - pose.position.x) + (truePose.position.y - pose.position.y) * (truePose.position.y - pose.position.y) );
+		  	double poseError = sqrt(
+				(synchronized_true_pose.position.x - pose.position.x) * (synchronized_true_pose.position.x - pose.position.x)
+				+ (synchronized_true_pose.position.y - pose.position.y) * (synchronized_true_pose.position.y - pose.position.y));
 			if(poseError > maxError)
 				maxError = poseError;
 			double distDriven = sqrt( (truePose.position.x) * (truePose.position.x) + (truePose.position.y) * (truePose.position.y) );
@@ -305,7 +388,6 @@ int main(){
 			}
 		}
 
-			pclCloud.points.clear();
 		}
   	}
 	return 0;
