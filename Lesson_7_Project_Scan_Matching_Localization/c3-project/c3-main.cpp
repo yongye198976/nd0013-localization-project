@@ -201,15 +201,61 @@ int main(){
 			
 			new_scan = true;
 			// TODO: (Filter scan using voxel filter)
+			pcl::VoxelGrid<PointT> voxelFilter;
+			voxelFilter.setInputCloud(scanCloud);
+			voxelFilter.setLeafSize(0.5f, 0.5f, 0.5f);
+			voxelFilter.filter(*cloudFiltered);
 
 			// TODO: Find pose transform by using ICP or NDT matching
-			//pose = ....
+			PointCloudT::Ptr registrationScan(new PointCloudT);
+			pcl::transformPointCloud(*cloudFiltered, *registrationScan, transform2D(pi / 2.0, 0, 0));
+			static PointCloudT::Ptr filteredMap(new PointCloudT);
+			if(filteredMap->empty()){
+				pcl::VoxelGrid<PointT> mapFilter;
+				mapFilter.setInputCloud(mapCloud);
+				mapFilter.setLeafSize(0.3f, 0.3f, 0.3f);
+				mapFilter.filter(*filteredMap);
+			}
+			static Eigen::Matrix4d poseTransform = Eigen::Matrix4d::Identity();
+			static std::chrono::time_point<std::chrono::system_clock> previousScanTime = lastScanTime;
+			double deltaTime = std::chrono::duration<double>(lastScanTime - previousScanTime).count();
+			previousScanTime = lastScanTime;
+			deltaTime = min(max(deltaTime, 0.0), 1.0);
+			auto velocity = vehicle->GetVelocity();
+			auto angularVelocity = vehicle->GetAngularVelocity();
+			Pose predictedPose = pose;
+			predictedPose.position.x += velocity.x * deltaTime;
+			predictedPose.position.y += velocity.y * deltaTime;
+			predictedPose.rotation.yaw += angularVelocity.z * pi / 180.0 * deltaTime;
+			Eigen::Matrix4d initialTransform = transform3D(predictedPose.rotation.yaw,
+				predictedPose.rotation.pitch, predictedPose.rotation.roll, predictedPose.position.x,
+				predictedPose.position.y, predictedPose.position.z);
+			PointCloudT::Ptr transformedSource(new PointCloudT);
+			pcl::transformPointCloud(*registrationScan, *transformedSource, initialTransform);
+			pcl::IterativeClosestPoint<PointT, PointT> icp;
+			icp.setMaximumIterations(40);
+			icp.setMaxCorrespondenceDistance(2.0);
+			icp.setTransformationEpsilon(0.0001);
+			icp.setEuclideanFitnessEpsilon(0.001);
+			icp.setInputSource(transformedSource);
+			icp.setInputTarget(filteredMap);
+			PointCloudT::Ptr alignedScan(new PointCloudT);
+			icp.align(*alignedScan);
+			Eigen::Matrix4d nextTransform = initialTransform;
+			if(icp.hasConverged()){
+				Eigen::Matrix4d correction = icp.getFinalTransformation().cast<double>();
+				nextTransform = correction * initialTransform;
+			}
+			poseTransform = nextTransform;
+			pose = getPose(poseTransform);
 
 			// TODO: Transform scan so it aligns with ego's actual pose and render that scan
+			PointCloudT::Ptr transformedScan(new PointCloudT);
+			pcl::transformPointCloud(*registrationScan, *transformedScan, poseTransform);
 
 			viewer->removePointCloud("scan");
 			// TODO: Change `scanCloud` below to your transformed scan
-			renderPointCloud(viewer, scanCloud, "scan", Color(1,0,0) );
+			renderPointCloud(viewer, transformedScan, "scan", Color(1,0,0) );
 
 			viewer->removeAllShapes();
 			drawCar(pose, 1,  Color(0,1,0), 0.35, viewer);
